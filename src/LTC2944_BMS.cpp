@@ -1,7 +1,7 @@
 #include "LTC2944_BMS.h"
 
 // ──────────────────────────────────────────────────────────────────────────────
-// LTC2944 I²C address & registers
+// LTC2944 I2C address & registers
 // ──────────────────────────────────────────────────────────────────────────────
 static const uint8_t LTC2944_ADDR           = 0x64;
 static const uint8_t REG_STATUS             = 0x00;
@@ -10,6 +10,12 @@ static const uint8_t REG_ACC_CHARGE_MSB     = 0x02;
 static const uint8_t REG_VOLTAGE_MSB        = 0x08;
 static const uint8_t REG_CURRENT_MSB        = 0x0E;
 static const uint8_t REG_TEMPERATURE_MSB    = 0x14;
+
+// Control register bit fields
+// Bits [5:3] = prescaler M selection  (000=1, 001=2, 010=4, 011=8,
+//                                       100=16, 101=32, 110=64, 111=128)
+// Bits [1:0] = ADC mode               (11 = automatic / continuous scan)
+static const uint8_t CTRL_ADC_AUTO          = 0x03;  // bits[1:0] for auto scan
 
 // ──────────────────────────────────────────────────────────────────────────────
 // EEPROM addresses
@@ -25,7 +31,7 @@ static const int EE_CAL_EMPTY_MAGIC = 0x2E;
 static const int EE_CAL_FULL_RAW    = 0x30;
 static const int EE_CAL_FULL_MAGIC  = 0x32;
 static const int EE_LEARNED_SLOT_A  = 0xA0;
-static const int EE_LEARNED_SLOT_B  = EE_LEARNED_SLOT_A + (int)sizeof(LTC2944_BMS::LearnedRecord);
+static const int EE_LEARNED_SLOT_B  = EE_LEARNED_SLOT_A + (int)sizeof(LearnedRecord);
 
 static const uint32_t EEPROM_MAGIC       = 0x42C0FFEEul;
 static const uint32_t CAL_MAGIC          = 0xCA1BCA1Bul;
@@ -72,7 +78,6 @@ static const char N_GEL_24V[]   PROGMEM = "GEL_24V";
 static const char N_GEL_48V[]   PROGMEM = "GEL_48V";
 static const char N_INVALID[]   PROGMEM = "INVALID";
 
-// Internal profile table stored in flash
 struct RawProfile {
     bool    valid;
     uint8_t chem;
@@ -116,10 +121,12 @@ static const uint8_t kProfileCount = sizeof(kProfiles) / sizeof(RawProfile);
 LTC2944_BMS::LTC2944_BMS()
     : _chem(CHEM_LIION)
     , _classCode(0)
-    , _shuntOhm(0.010f)
+    , _shuntOhm(0.001f)           // 1 mOhm — matches reference hardware
     , _pinLoadEn(BMS_DEFAULT_PIN_LOAD_EN)
     , _pinStatusLed(BMS_DEFAULT_PIN_STATUS_LED)
     , _currentDeadbandA(0.030f)
+    , _capacityMah(0)
+    , _prescaler(1)
     , _meas{}
     , _disconnected(false)
     , _profileMismatch(false)
@@ -148,10 +155,59 @@ void LTC2944_BMS::setProfile(BatteryChem chem, uint8_t classCode) {
     _classCode = classCode;
 }
 
-void LTC2944_BMS::setShuntResistor(float ohms)       { _shuntOhm = ohms; }
-void LTC2944_BMS::setPinLoadEnable(uint8_t pin)       { _pinLoadEn = pin; }
-void LTC2944_BMS::setPinStatusLed(uint8_t pin)        { _pinStatusLed = pin; }
-void LTC2944_BMS::setCurrentDeadband(float amps)      { _currentDeadbandA = amps; }
+void LTC2944_BMS::setCapacity(uint16_t capacityMah) {
+    _capacityMah = capacityMah;
+}
+
+void LTC2944_BMS::setShuntResistor(float ohms)  { _shuntOhm = ohms; }
+void LTC2944_BMS::setPinLoadEnable(uint8_t pin)  { _pinLoadEn = pin; }
+void LTC2944_BMS::setPinStatusLed(uint8_t pin)   { _pinStatusLed = pin; }
+void LTC2944_BMS::setCurrentDeadband(float amps) { _currentDeadbandA = amps; }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Prescaler computation
+//
+// LTC2944 datasheet formula:
+//   M = (Q_bat [mAh] * R_sense [mOhm]) / 40.96
+//
+// M must be one of: 1, 2, 4, 8, 16, 32, 64, 128.
+// We round up to the next valid power-of-2 to ensure the full capacity
+// fits within the 16-bit ACR register range.
+// ──────────────────────────────────────────────────────────────────────────────
+uint8_t LTC2944_BMS::_computePrescaler() const {
+    if (_capacityMah == 0) return 1;
+    float shuntMilliOhm = _shuntOhm * 1000.0f;
+    float mIdeal = ((float)_capacityMah * shuntMilliOhm) / 40.96f;
+    // Round up to next power of 2, clamped to 1–128
+    uint8_t m = 1;
+    while ((float)m < mIdeal && m < 128) m <<= 1;
+    return m;
+}
+
+bool LTC2944_BMS::_writePrescaler(uint8_t m) {
+    // Encode M into bits [5:3] of the control register
+    // M=1->000, M=2->001, M=4->010, M=8->011, M=16->100, M=32->101, M=64->110, M=128->111
+    uint8_t mBits = 0;
+    uint8_t tmp = m;
+    while (tmp > 1) { tmp >>= 1; mBits++; }
+    uint8_t ctrl = (uint8_t)((mBits << 3) | CTRL_ADC_AUTO);
+    return _writeReg8(REG_CONTROL, ctrl);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ACR to mAh conversion
+//
+// From the LTC2944 datasheet:
+//   charge [mAh] = (ACR / 65535) * (0.340 / R_sense[Ohm]) * (M / 128) * 1000
+//
+// Where 0.340 Ah is the full-scale charge at M=128 and R_sense=1 Ohm.
+// Simplified: charge_mAh = ACR * (0.340 * 1000 * M) / (65535 * 128 * R_sense)
+// ──────────────────────────────────────────────────────────────────────────────
+float LTC2944_BMS::_rawAcrToMah(uint16_t raw) const {
+    // full-scale mAh = (0.340 / R_sense) * (M / 128) * 1000
+    float fullScaleMah = (0.340f / _shuntOhm) * ((float)_prescaler / 128.0f) * 1000.0f;
+    return ((float)raw / 65535.0f) * fullScaleMah;
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Initialisation
@@ -170,11 +226,13 @@ bool LTC2944_BMS::begin() {
     _resolveProfile();
     _loadLearnedModel();
 
+    _prescaler = _computePrescaler();
     return reinitChip();
 }
 
 bool LTC2944_BMS::reinitChip() {
-    if (!_writeReg8(REG_CONTROL, 0xFC)) return false;   // automatic scan mode
+    delay(50);
+    if (!_writePrescaler(_prescaler)) return false;
     delay(50);
     uint8_t ctrl = 0;
     return _readReg8(REG_CONTROL, ctrl);
@@ -224,20 +282,37 @@ bool LTC2944_BMS::update() {
 
     int soc = _estimateSoc(vbat, current, rawACR, _charging);
 
+    // ── Remaining capacity ──────────────────────────────────────────────────
+    uint16_t remainingMah = 0;
+    if (_capacityMah > 0) {
+        remainingMah = (uint16_t)(((long)soc * _capacityMah) / 100L);
+    }
+
+    // ── Runtime estimation ──────────────────────────────────────────────────
+    int16_t runtimeMinutes = -1;
+    if (_capacityMah > 0 && !_charging && current < -0.030f) {
+        // current is negative while discharging; use absolute value
+        float dischargeA = _absf(current);
+        // runtime [min] = remainingMah / (dischargeA * 1000) * 60
+        runtimeMinutes = (int16_t)(((float)remainingMah / (dischargeA * 1000.0f)) * 60.0f);
+        if (runtimeMinutes < 0) runtimeMinutes = 0;
+    }
+
     _updateResistanceLearning(vbat, current, now);
     _updateRelaxedSignature(vbat, current, rawACR, now);
     _saveLearnedModel(false);
 
-    _meas.soc         = soc;
-    _meas.voltage     = vbat;
-    _meas.current     = current;
-    _meas.temperature = tempC;
-    _meas.rawACR      = rawACR;
-    _meas.rawCurrent  = rawCurr;
-    _meas.charging    = _charging;
-    _meas.alarms      = _makeAlarms(vbat, current, tempC, true);
+    _meas.soc            = soc;
+    _meas.voltage        = vbat;
+    _meas.current        = current;
+    _meas.temperature    = tempC;
+    _meas.remainingMah   = remainingMah;
+    _meas.runtimeMinutes = runtimeMinutes;
+    _meas.rawACR         = rawACR;
+    _meas.rawCurrent     = rawCurr;
+    _meas.charging       = _charging;
+    _meas.alarms         = _makeAlarms(vbat, current, tempC, true);
 
-    // Status LED: on during active calibration phases
     bool ledOn = _calibrationMode
               && _calPhase != CAL_DONE
               && _calPhase != CAL_ABORT;
@@ -250,16 +325,19 @@ bool LTC2944_BMS::update() {
 // Accessors
 // ──────────────────────────────────────────────────────────────────────────────
 
-int      LTC2944_BMS::getSoc()         const { return _meas.soc; }
-float    LTC2944_BMS::getVoltage()     const { return _meas.voltage; }
-float    LTC2944_BMS::getCurrent()     const { return _meas.current; }
-float    LTC2944_BMS::getTemperature() const { return _meas.temperature; }
-uint16_t LTC2944_BMS::getAlarms()     const { return _meas.alarms; }
-bool     LTC2944_BMS::isCharging()    const { return _meas.charging; }
+int      LTC2944_BMS::getSoc()            const { return _meas.soc; }
+float    LTC2944_BMS::getVoltage()        const { return _meas.voltage; }
+float    LTC2944_BMS::getCurrent()        const { return _meas.current; }
+float    LTC2944_BMS::getTemperature()    const { return _meas.temperature; }
+uint16_t LTC2944_BMS::getAlarms()         const { return _meas.alarms; }
+bool     LTC2944_BMS::isCharging()        const { return _meas.charging; }
+uint16_t LTC2944_BMS::getRemainingMah()   const { return _meas.remainingMah; }
+int16_t  LTC2944_BMS::getRuntimeMinutes() const { return _meas.runtimeMinutes; }
+uint16_t LTC2944_BMS::getCapacityMah()    const { return _capacityMah; }
+uint8_t  LTC2944_BMS::getPrescaler()      const { return _prescaler; }
 
 BmsMeasurement LTC2944_BMS::getMeasurement() const { return _meas; }
-
-bool LTC2944_BMS::isBatteryDisconnected() const { return _disconnected; }
+bool LTC2944_BMS::isBatteryDisconnected()    const { return _disconnected; }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Calibration public API
@@ -286,7 +364,6 @@ bool LTC2944_BMS::isCalibrated() const {
 
 void LTC2944_BMS::resetCalibration() {
     _cal = {};
-    // Erase EEPROM magic word so calibrationLoad() returns invalid next boot
     uint32_t zero = 0;
     EEPROM.put(EE_CAL_MAGIC, zero);
 }
@@ -308,16 +385,11 @@ void LTC2944_BMS::resetForNewBattery() {
 // Utility
 // ──────────────────────────────────────────────────────────────────────────────
 
-const char* LTC2944_BMS::getProfileName() const {
-    return _profileNameBuf;
-}
-
-bool LTC2944_BMS::isProfilePlausible() const {
-    return !_profileMismatch;
-}
+const char* LTC2944_BMS::getProfileName()   const { return _profileNameBuf; }
+bool        LTC2944_BMS::isProfilePlausible() const { return !_profileMismatch; }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// I²C helpers
+// I2C helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
 bool LTC2944_BMS::_writeReg8(uint8_t reg, uint8_t val) {
@@ -434,16 +506,16 @@ int LTC2944_BMS::_socFromVoltageCurve(float vbat, float currentA, uint16_t rawAC
                                        int lowerBandSoc, int upperBandSoc) {
     if (!_profile.valid || _profile.seriesCount == 0) return 0;
 
-    const float irOhm          = _effectiveResistance();
-    const float relaxCurrentA  = 0.05f;
+    const float irOhm           = _effectiveResistance();
+    const float relaxCurrentA   = 0.05f;
     const float fullCompCurrent = 0.50f;
 
-    float cellV    = vbat / (float)_profile.seriesCount;
-    float vEmpty   = (_cal.valid && isfinite(_cal.vEmpty) ? _cal.vEmpty : _profile.vEmpty)
-                     / (float)_profile.seriesCount;
-    float vNom     = _profile.vNominal / (float)_profile.seriesCount;
-    float vFull    = (_cal.valid && isfinite(_cal.vFull)  ? _cal.vFull  : _profile.vFull)
-                     / (float)_profile.seriesCount;
+    float cellV  = vbat / (float)_profile.seriesCount;
+    float vEmpty = (_cal.valid && isfinite(_cal.vEmpty) ? _cal.vEmpty : _profile.vEmpty)
+                   / (float)_profile.seriesCount;
+    float vNom   = _profile.vNominal / (float)_profile.seriesCount;
+    float vFull  = (_cal.valid && isfinite(_cal.vFull) ? _cal.vFull : _profile.vFull)
+                   / (float)_profile.seriesCount;
 
     float absI = _absf(currentA);
     float relax;
@@ -454,7 +526,6 @@ int LTC2944_BMS::_socFromVoltageCurve(float vbat, float currentA, uint16_t rawAC
     float compV = cellV - (currentA * irOhm * relax);
     if (charging) compV -= (chargeCompV * relax);
 
-    // If ACR is at or below calibrated empty, SOC = 0
     if (_cal.valid && _cal.hasEmptyRaw && rawACR <= _cal.emptyChargeRaw) return 0;
 
     int soc;
@@ -487,7 +558,7 @@ int LTC2944_BMS::_adaptiveBlend(int coulombSoc, int voltageSoc, float currentA) 
     else if (absI < 5.0f) vw = 0.15f;
     else                  vw = 0.05f;
 
-    float cw = 1.0f - vw;
+    float cw  = 1.0f - vw;
     int   soc = (int)lround((float)coulombSoc * cw + (float)voltageSoc * vw);
     return _clamp(soc, 0, 100);
 }
@@ -501,15 +572,15 @@ uint16_t LTC2944_BMS::_makeAlarms(float v, float i, float t, bool sensorOk) cons
     if (!sensorOk)          a |= ALARM_SENSOR_FAIL;
     if (!_profile.valid)    a |= ALARM_NO_PROFILE;
     if (_profile.valid) {
-        if (v < _profile.vEmpty)    a |= ALARM_UNDER_VOLTAGE;
-        if (v > _profile.vFull)     a |= ALARM_OVER_VOLTAGE;
-        if (v < _profile.vAbsLow)   a |= ALARM_ABS_UNDER_V;
-        if (v > _profile.vAbsHigh)  a |= ALARM_ABS_OVER_V;
+        if (v < _profile.vEmpty)   a |= ALARM_UNDER_VOLTAGE;
+        if (v > _profile.vFull)    a |= ALARM_OVER_VOLTAGE;
+        if (v < _profile.vAbsLow)  a |= ALARM_ABS_UNDER_V;
+        if (v > _profile.vAbsHigh) a |= ALARM_ABS_OVER_V;
     }
-    if (t < -10.0f || t > 60.0f)   a |= ALARM_TEMPERATURE;
-    if (i < -5.5f)                  a |= ALARM_OVER_CURRENT;
-    if (i >  3.0f)                  a |= ALARM_CHARGE_CURRENT;
-    if (_profileMismatch)           a |= ALARM_PROFILE_MISMATCH;
+    if (t < -10.0f || t > 60.0f) a |= ALARM_TEMPERATURE;
+    if (i < -5.5f)                a |= ALARM_OVER_CURRENT;
+    if (i >  3.0f)                a |= ALARM_CHARGE_CURRENT;
+    if (_profileMismatch)         a |= ALARM_PROFILE_MISMATCH;
     return a;
 }
 
@@ -523,7 +594,7 @@ bool LTC2944_BMS::_checkDisconnectOnReadFailure() {
         _i2cFailCount = 0;
         reinitChip();
     }
-    return false;   // caller may override with PIN_NEW_BAT check if desired
+    return false;
 }
 
 bool LTC2944_BMS::_checkDisconnectOnMeasurement(float vbat, float currentA) {
@@ -543,17 +614,9 @@ bool LTC2944_BMS::_checkDisconnectOnMeasurement(float vbat, float currentA) {
     return false;
 }
 
-void LTC2944_BMS::_writeDisconnectFlag() {
-    EEPROM.update(EE_DISCONNECT, DISCONNECT_MARKER);
-}
-
-void LTC2944_BMS::_clearDisconnectFlag() {
-    EEPROM.update(EE_DISCONNECT, 0x00);
-}
-
-bool LTC2944_BMS::_readDisconnectFlag() const {
-    return EEPROM.read(EE_DISCONNECT) == DISCONNECT_MARKER;
-}
+void LTC2944_BMS::_writeDisconnectFlag() { EEPROM.update(EE_DISCONNECT, DISCONNECT_MARKER); }
+void LTC2944_BMS::_clearDisconnectFlag() { EEPROM.update(EE_DISCONNECT, 0x00); }
+bool LTC2944_BMS::_readDisconnectFlag()  const { return EEPROM.read(EE_DISCONNECT) == DISCONNECT_MARKER; }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Calibration state machine
@@ -566,7 +629,6 @@ void LTC2944_BMS::_setLoad(bool en) {
 void LTC2944_BMS::_enterCalPhase(CalPhase phase) {
     _calPhase        = phase;
     _calPhaseStartMs = millis();
-
     switch (phase) {
         case CAL_ZERO:
             _zeroSamplesTaken  = 0;
@@ -590,14 +652,12 @@ void LTC2944_BMS::_updateCalibration(uint16_t rawCurr, uint16_t rawACR,
                                       float vbat, float tempC, float currentA) {
     if (!_calibrationMode) return;
 
-    // Safety abort on over-temperature
     if ((_calPhase == CAL_DISCHARGE || _calPhase == CAL_CHARGE) && tempC > 55.0f) {
         _enterCalPhase(CAL_ABORT);
         return;
     }
 
     switch (_calPhase) {
-
         case CAL_ZERO: {
             int32_t delta = (int32_t)rawCurr - 32767;
             _zeroAccumRawDelta += delta;
@@ -611,12 +671,10 @@ void LTC2944_BMS::_updateCalibration(uint16_t rawCurr, uint16_t rawACR,
             }
             break;
         }
-
         case CAL_WAIT:
             if ((uint32_t)(millis() - _calPhaseStartMs) >= CAL_SETTLE_MS)
                 _enterCalPhase(CAL_DISCHARGE);
             break;
-
         case CAL_DISCHARGE:
             if (_profile.valid && vbat <= _profile.vEmpty) {
                 _saveCalEmpty(vbat, rawACR);
@@ -625,10 +683,9 @@ void LTC2944_BMS::_updateCalibration(uint16_t rawCurr, uint16_t rawACR,
                 _enterCalPhase(CAL_ABORT);
             }
             break;
-
         case CAL_CHARGE:
             if (_profile.valid
-                    && vbat    >= (_profile.vFull * CAL_FULL_VOLT_PCT)
+                    && vbat     >= (_profile.vFull * CAL_FULL_VOLT_PCT)
                     && currentA >= 0.0f
                     && currentA <= CAL_FULL_CURRENT_A) {
                 _saveCalFull(vbat, rawACR);
@@ -637,7 +694,6 @@ void LTC2944_BMS::_updateCalibration(uint16_t rawCurr, uint16_t rawACR,
                 _enterCalPhase(CAL_ABORT);
             }
             break;
-
         default:
             break;
     }
@@ -694,10 +750,10 @@ void LTC2944_BMS::_loadCalibration() {
 }
 
 void LTC2944_BMS::_saveCalEmpty(float v, uint16_t raw) {
-    _cal.vEmpty       = v;
+    _cal.vEmpty        = v;
     _cal.emptyChargeRaw = raw;
-    _cal.hasEmptyRaw  = true;
-    _cal.valid        = true;
+    _cal.hasEmptyRaw   = true;
+    _cal.valid         = true;
     EEPROM.put(EE_CAL_MAGIC,       CAL_MAGIC);
     EEPROM.put(EE_CAL_EMPTY_V,     v);
     EEPROM.put(EE_CAL_EMPTY_RAW,   raw);
@@ -705,10 +761,10 @@ void LTC2944_BMS::_saveCalEmpty(float v, uint16_t raw) {
 }
 
 void LTC2944_BMS::_saveCalFull(float v, uint16_t raw) {
-    _cal.vFull        = v;
-    _cal.fullChargeRaw = raw;
-    _cal.hasFullRaw   = true;
-    _cal.valid        = true;
+    _cal.vFull         = v;
+    _cal.fullChargeRaw  = raw;
+    _cal.hasFullRaw    = true;
+    _cal.valid         = true;
     EEPROM.put(EE_CAL_MAGIC,      CAL_MAGIC);
     EEPROM.put(EE_CAL_FULL_V,     v);
     EEPROM.put(EE_CAL_FULL_RAW,   raw);
@@ -720,15 +776,15 @@ void LTC2944_BMS::_saveCalFull(float v, uint16_t raw) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 void LTC2944_BMS::_resetLearnedModel(bool /*newBattery*/) {
-    _model.resistance           = 0.08f;
-    _model.confidence           = 0.0f;
-    _model.valid                = false;
-    _model.dirty                = true;
-    _model.samples              = 0;
-    _model.lastRelaxedVoltage   = 0.0f;
-    _model.lastSeenRawACR       = 0;
-    _model.storedChem           = (uint8_t)_chem;
-    _model.storedClassCode      = _classCode;
+    _model.resistance         = 0.08f;
+    _model.confidence         = 0.0f;
+    _model.valid              = false;
+    _model.dirty              = true;
+    _model.samples            = 0;
+    _model.lastRelaxedVoltage = 0.0f;
+    _model.lastSeenRawACR     = 0;
+    _model.storedChem         = (uint8_t)_chem;
+    _model.storedClassCode    = _classCode;
 }
 
 bool LTC2944_BMS::_loadLearnedModel() {
@@ -793,23 +849,23 @@ bool LTC2944_BMS::_saveLearnedModel(bool force) {
     if (seqA <= seqB) EEPROM.put(EE_LEARNED_SLOT_A, out);
     else              EEPROM.put(EE_LEARNED_SLOT_B, out);
 
-    _model.dirty        = false;
-    _lastLearnedSaveMs  = millis();
+    _model.dirty       = false;
+    _lastLearnedSaveMs = millis();
     return true;
 }
 
 void LTC2944_BMS::_updateResistanceLearning(float v, float i, uint32_t now) {
-    const float minDeltaI   = 0.50f;
-    const float minDeltaV   = 0.02f;
-    const float maxR        = 0.50f;
-    const float alpha       = 0.10f;
-    const uint32_t window   = 3000UL;
+    const float minDeltaI = 0.50f;
+    const float minDeltaV = 0.02f;
+    const float maxR      = 0.50f;
+    const float alpha     = 0.10f;
+    const uint32_t window = 3000UL;
 
     if (!_resLearn.baselineValid) {
         if (_currentNearZero(i)) {
-            _resLearn.baselineV    = v;
-            _resLearn.baselineI    = i;
-            _resLearn.baselineMs   = now;
+            _resLearn.baselineV     = v;
+            _resLearn.baselineI     = i;
+            _resLearn.baselineMs    = now;
             _resLearn.baselineValid = true;
         }
         return;
@@ -817,8 +873,8 @@ void LTC2944_BMS::_updateResistanceLearning(float v, float i, uint32_t now) {
 
     if ((uint32_t)(now - _resLearn.baselineMs) < window) {
         if (_currentNearZero(i)) {
-            _resLearn.baselineV = v;
-            _resLearn.baselineI = i;
+            _resLearn.baselineV  = v;
+            _resLearn.baselineI  = i;
             _resLearn.baselineMs = now;
         }
         return;
@@ -844,9 +900,9 @@ void LTC2944_BMS::_updateResistanceLearning(float v, float i, uint32_t now) {
     }
 
     if (_currentNearZero(i)) {
-        _resLearn.baselineV    = v;
-        _resLearn.baselineI    = i;
-        _resLearn.baselineMs   = now;
+        _resLearn.baselineV     = v;
+        _resLearn.baselineI     = i;
+        _resLearn.baselineMs    = now;
         _resLearn.baselineValid = true;
     } else if (_absf(i - _resLearn.baselineI) > 0.20f) {
         _resLearn.baselineValid = false;
@@ -859,9 +915,9 @@ void LTC2944_BMS::_updateRelaxedSignature(float v, float i, uint16_t rawACR, uin
         _model.lastRelaxedVoltage = v;
     else
         _model.lastRelaxedVoltage = 0.95f * _model.lastRelaxedVoltage + 0.05f * v;
-    _model.lastSeenRawACR   = rawACR;
-    _lastRelaxedSeenMs       = now;
-    _model.dirty             = true;
+    _model.lastSeenRawACR = rawACR;
+    _lastRelaxedSeenMs    = now;
+    _model.dirty          = true;
 }
 
 float LTC2944_BMS::_effectiveResistance() const {
@@ -893,13 +949,13 @@ uint8_t LTC2944_BMS::_recordCrc(const LearnedRecord& r) const {
 }
 
 bool LTC2944_BMS::_isRecordValid(const LearnedRecord& r) const {
-    if (r.magic   != LEARNED_MAGIC)     return false;
-    if (r.version != LEARNED_VERSION)   return false;
-    if (r.length  != sizeof(LearnedRecord)) return false;
-    if (_recordCrc(r) != r.crc)         return false;
+    if (r.magic   != LEARNED_MAGIC)          return false;
+    if (r.version != LEARNED_VERSION)         return false;
+    if (r.length  != sizeof(LearnedRecord))   return false;
+    if (_recordCrc(r) != r.crc)               return false;
     if (!isfinite(r.resistance) || r.resistance < 0.0f || r.resistance > 0.50f) return false;
     if (!isfinite(r.confidence) || r.confidence < 0.0f || r.confidence > 1.0f)  return false;
-    if (!isfinite(r.lastRelaxedVoltage) || r.lastRelaxedVoltage < 0.0f) return false;
+    if (!isfinite(r.lastRelaxedVoltage) || r.lastRelaxedVoltage < 0.0f)          return false;
     return true;
 }
 
@@ -907,15 +963,7 @@ bool LTC2944_BMS::_isRecordValid(const LearnedRecord& r) const {
 // Static math helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-int   LTC2944_BMS::_clamp(int v, int lo, int hi) {
-    return v < lo ? lo : v > hi ? hi : v;
-}
-float LTC2944_BMS::_clampf(float v, float lo, float hi) {
-    return v < lo ? lo : v > hi ? hi : v;
-}
-float LTC2944_BMS::_absf(float v) {
-    return v >= 0.0f ? v : -v;
-}
-bool LTC2944_BMS::_currentNearZero(float i) const {
-    return _absf(i) < 0.15f;
-}
+int   LTC2944_BMS::_clamp(int v, int lo, int hi)       { return v < lo ? lo : v > hi ? hi : v; }
+float LTC2944_BMS::_clampf(float v, float lo, float hi){ return v < lo ? lo : v > hi ? hi : v; }
+float LTC2944_BMS::_absf(float v)                       { return v >= 0.0f ? v : -v; }
+bool  LTC2944_BMS::_currentNearZero(float i) const      { return _absf(i) < 0.15f; }
