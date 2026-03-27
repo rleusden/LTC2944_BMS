@@ -21,6 +21,10 @@ Designed for **ATmega328P** boards (Arduino Pro Mini, Nano, Uno).
 
 ---
 
+![LTC2944 bridge testing](https://raw.githubusercontent.com/rleusden/ESP32-BatteryGauge/main/images/ltc2944_bridge_testing.png)
+
+---
+
 ## Installation
 
 1. Download or clone this repository.
