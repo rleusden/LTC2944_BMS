@@ -185,12 +185,16 @@ uint8_t LTC2944_BMS::_computePrescaler() const {
 }
 
 bool LTC2944_BMS::_writePrescaler(uint8_t m) {
-    // Encode M into bits [5:3] of the control register
-    // M=1->000, M=2->001, M=4->010, M=8->011, M=16->100, M=32->101, M=64->110, M=128->111
     uint8_t mBits = 0;
     uint8_t tmp = m;
     while (tmp > 1) { tmp >>= 1; mBits++; }
-    uint8_t ctrl = (uint8_t)((mBits << 3) | CTRL_ADC_AUTO);
+    // 0xFC = 11111100:
+    //   bits[7:6] = 11  (VBAT alert off)
+    //   bits[5:3] = 111 (M=128, we override below)
+    //   bits[2:1] = 10  (ADC = automatic / continuous)
+    //   bit[0]    = 0   (not shutdown)
+    // Start from 0xC4 (VBAT off, ADC auto, not shutdown) and insert M
+    uint8_t ctrl = (uint8_t)(0xC4 | (mBits << 3));
     return _writeReg8(REG_CONTROL, ctrl);
 }
 
@@ -231,7 +235,6 @@ bool LTC2944_BMS::begin() {
 }
 
 bool LTC2944_BMS::reinitChip() {
-    delay(50);
     if (!_writePrescaler(_prescaler)) return false;
     delay(50);
     uint8_t ctrl = 0;
