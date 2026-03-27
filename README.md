@@ -5,6 +5,10 @@ LiFePO4, AGM, and GEL battery packs across a wide range of series-cell configura
 
 Designed for **ATmega328P** boards (Arduino Pro Mini, Nano, Uno).
 
+[![Arduino Library Manager](https://img.shields.io/badge/Arduino-Library%20Manager-blue)](https://www.arduino.cc/reference/en/libraries/ltc2944_bms/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![Platform: AVR](https://img.shields.io/badge/platform-AVR%20%2F%20ATmega328P-orange)
+
 ---
 
 ## Features
