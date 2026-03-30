@@ -1,0 +1,154 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# ESPHome configuration for receiving LTC2944_BMS data over UART
+#
+# The Arduino Pro Mini runs BasicBMS.ino with OUTPUT_ESPHOME selected.
+# It sends one line per second in this format (terminated with \r\n):
+#
+#   soc,voltage,current_mA,temp_C,charging,remaining_mAh,runtime_min,alarms\r\n
+#   Example: 65,3.849,-748,17.5,0,1300,104,0\r\n
+#
+# Wiring (Pro Mini -> ESP32):
+#   Pro Mini TX  ->  ESP32 RX pin (GPIO16 below)
+#   Pro Mini GND ->  ESP32 GND
+#   (TX only — no data goes from ESP32 to Pro Mini)
+#
+# Baud rate must match the Pro Mini sketch (9600).
+# ──────────────────────────────────────────────────────────────────────────────
+
+esphome:
+  name: battery-monitor
+  friendly_name: Battery Monitor
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# Disable logger on UART0 so it doesn't interfere
+logger:
+  baud_rate: 0
+
+# ── UART bus ─────────────────────────────────────────────────────────────────
+# Connect Pro Mini TX to ESP32 GPIO16 (RX).
+# GPIO17 (TX) is defined but not used — Pro Mini is send-only.
+uart:
+  id: uart_bus
+  rx_pin: GPIO16
+  tx_pin: GPIO17
+  baud_rate: 9600
+  debug:
+    direction: RX
+    dummy_receiver: true
+    after:
+      delimiter: "\r\n"
+    sequence:
+      - lambda: |-
+          // Convert received bytes to a null-terminated string
+          std::string str(bytes.begin(), bytes.end());
+
+          // Skip lines that start with '#' (diagnostic messages from the Pro Mini)
+          if (str.empty() || str[0] == '#') return;
+
+          // Parse the comma-separated line
+          // Format: soc,voltage,current_mA,temp_C,charging,remaining_mAh,runtime_min,alarms
+          int   soc     = 0;
+          float voltage = 0.0f;
+          float current = 0.0f;
+          float temp    = 0.0f;
+          int   chg     = 0;
+          int   rem     = 0;
+          int   runtime = 0;
+          int   alarms  = 0;
+
+          if (sscanf(str.c_str(), "%d,%f,%f,%f,%d,%d,%d,%d",
+                     &soc, &voltage, &current, &temp,
+                     &chg, &rem, &runtime, &alarms) == 8) {
+
+            id(bms_soc).publish_state(soc);
+            id(bms_voltage).publish_state(voltage);
+            id(bms_current).publish_state(current / 1000.0f);   // mA -> A
+            id(bms_temperature).publish_state(temp);
+            id(bms_charging).publish_state(chg == 1);
+            id(bms_remaining).publish_state(rem);
+            id(bms_runtime).publish_state(runtime >= 0 ? runtime : 0);
+            id(bms_alarms).publish_state(alarms);
+          }
+
+# ── Sensors ───────────────────────────────────────────────────────────────────
+
+sensor:
+  - platform: template
+    name: "Battery SOC"
+    id: bms_soc
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+
+  - platform: template
+    name: "Battery Voltage"
+    id: bms_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+
+  - platform: template
+    name: "Battery Current"
+    id: bms_current
+    unit_of_measurement: "A"
+    accuracy_decimals: 3
+    device_class: current
+    state_class: measurement
+
+  - platform: template
+    name: "Battery Temperature"
+    id: bms_temperature
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+
+  - platform: template
+    name: "Battery Remaining"
+    id: bms_remaining
+    unit_of_measurement: "mAh"
+    accuracy_decimals: 0
+    state_class: measurement
+    icon: mdi:battery-charging
+
+  - platform: template
+    name: "Battery Runtime"
+    id: bms_runtime
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    state_class: measurement
+    icon: mdi:timer-outline
+
+  - platform: template
+    name: "Battery Alarms"
+    id: bms_alarms
+    accuracy_decimals: 0
+    state_class: measurement
+    icon: mdi:alert-circle-outline
+
+# ── Binary sensors ────────────────────────────────────────────────────────────
+
+binary_sensor:
+  - platform: template
+    name: "Battery Charging"
+    id: bms_charging
+    device_class: battery_charging
