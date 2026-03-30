@@ -17,18 +17,16 @@
  *   LTC2944_BMS bms;
  *
  *   void setup() {
- *     bms.setProfile(CHEM_LIION, 0);   // 1S Li-ion
- *     bms.setCapacity(2000);           // 2000 mAh battery
- *     bms.setShuntResistor(0.001f);    // 1 mOhm shunt (reference hardware)
+ *     bms.setProfile(CHEM_LIION, 1);        // 2S Li-ion
+ *     bms.setCapacity(4200);                // 4200 mAh
+ *     bms.setShuntResistor(0.001f);         // 1 mOhm shunt
+ *     bms.setFullVoltage(8.30f);            // match your charger termination
+ *     bms.setOutputMode(OUTPUT_SERIAL);
  *     bms.begin();
  *   }
  *
  *   void loop() {
- *     if (bms.update()) {
- *       Serial.print("SOC: ");       Serial.print(bms.getSoc()); Serial.println("%");
- *       Serial.print("Remaining: "); Serial.print(bms.getRemainingMah()); Serial.println(" mAh");
- *       Serial.print("Runtime: ");   Serial.print(bms.getRuntimeMinutes()); Serial.println(" min");
- *     }
+ *     if (bms.update()) bms.print(Serial);
  *   }
  */
 
@@ -39,25 +37,55 @@
 #include <avr/pgmspace.h>
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Battery chemistry selector
+// Output mode
 // ──────────────────────────────────────────────────────────────────────────────
 
 /**
- * Battery chemistry types supported by the library.
- * Pass one of these to setProfile().
+ * Serial output format, set via setOutputMode() before begin().
+ *
+ * OUTPUT_SERIAL  (default)
+ *   Human-readable line, e.g.:
+ *   SOC=65%  V=3.849V  I=-748mA  T=17.5C  CHG=NO  REM=1300mAh  RUN=1h44m
+ *
+ * OUTPUT_CSV
+ *   Comma-separated values, header printed once in begin().
+ *   soc_%,voltage_V,current_mA,temp_C,charging,remaining_mAh,runtime_min,alarms
+ *   65,3.849,-748,17.5,0,1300,104,0
+ *
+ * OUTPUT_ESPHOME
+ *   Same fields as CSV, terminated with \r\n for ESPHome UART debug sscanf.
+ *   65,3.849,-748,17.5,0,1300,104,0\r\n
+ */
+enum OutputMode : uint8_t {
+    OUTPUT_SERIAL   = 0,
+    OUTPUT_CSV      = 1,
+    OUTPUT_ESPHOME  = 2
+};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Battery chemistry
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Battery chemistry types. Pass one of these to setProfile().
+ *
+ * Li-ion / LiFePO4 classCode -> series cell count:
+ *   0=1S  1=2S  2=3S  3=4S  4=6S  5=8S  6=12S  7=14S
+ *
+ * AGM / GEL classCode -> 12 V block count:
+ *   0=12V  1=24V  2=48V
  */
 enum BatteryChem : uint8_t {
-    CHEM_LIION   = 0,  ///< Li-ion / Li-polymer (3.7 V nominal per cell)
+    CHEM_LIION   = 0,  ///< Li-ion / Li-polymer  (3.7 V nominal per cell)
     CHEM_LIFEPO4 = 1,  ///< Lithium Iron Phosphate (3.2 V nominal per cell)
     CHEM_AGM     = 2,  ///< AGM lead-acid (12 V per block)
     CHEM_GEL     = 3   ///< GEL lead-acid  (12 V per block)
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Public data types
+// Measurement struct
 // ──────────────────────────────────────────────────────────────────────────────
 
-/** All live measurements returned by update(). */
 struct BmsMeasurement {
     int      soc;            ///< State of charge 0-100 %
     float    voltage;        ///< Pack voltage in Volts
@@ -65,53 +93,48 @@ struct BmsMeasurement {
     float    temperature;    ///< Die temperature in degrees C
     uint16_t remainingMah;   ///< Remaining capacity in mAh (0 if capacity not set)
     int16_t  runtimeMinutes; ///< Estimated runtime in minutes (-1 if unknown)
-    uint16_t rawACR;         ///< Raw accumulated charge register (for logging)
-    uint16_t rawCurrent;     ///< Raw current register (for logging / CRC)
+    uint16_t rawACR;         ///< Raw accumulated charge register
+    uint16_t rawCurrent;     ///< Raw current register
     bool     charging;       ///< true while charge current is detected
-    uint16_t alarms;         ///< Bitfield - see ALARM_* constants below
+    uint16_t alarms;         ///< Bitfield - see ALARM_* constants
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Alarm bits (BmsMeasurement::alarms)
+// Alarm bits
 // ──────────────────────────────────────────────────────────────────────────────
 static const uint16_t ALARM_SENSOR_FAIL      = 0x0001; ///< LTC2944 I2C read failed
 static const uint16_t ALARM_NO_PROFILE       = 0x0002; ///< Battery profile not resolved
 static const uint16_t ALARM_UNDER_VOLTAGE    = 0x0004; ///< vpack < vEmpty
 static const uint16_t ALARM_OVER_VOLTAGE     = 0x0008; ///< vpack > vFull
-static const uint16_t ALARM_ABS_UNDER_V      = 0x0010; ///< vpack < vAbsLow (hardware fault)
-static const uint16_t ALARM_ABS_OVER_V       = 0x0020; ///< vpack > vAbsHigh (hardware fault)
-static const uint16_t ALARM_TEMPERATURE      = 0x0040; ///< Temperature out of -10..60 C
-static const uint16_t ALARM_OVER_CURRENT     = 0x0080; ///< Discharge current > 5.5 A
-static const uint16_t ALARM_CHARGE_CURRENT   = 0x0100; ///< Charge current > 3.0 A
-static const uint16_t ALARM_PROFILE_MISMATCH = 0x0200; ///< Measured voltage outside profile range
+static const uint16_t ALARM_ABS_UNDER_V      = 0x0010; ///< vpack < vAbsLow
+static const uint16_t ALARM_ABS_OVER_V       = 0x0020; ///< vpack > vAbsHigh
+static const uint16_t ALARM_TEMPERATURE      = 0x0040; ///< Temperature out of range
+static const uint16_t ALARM_OVER_CURRENT     = 0x0080; ///< Discharge current too high
+static const uint16_t ALARM_CHARGE_CURRENT   = 0x0100; ///< Charge current too high
+static const uint16_t ALARM_PROFILE_MISMATCH = 0x0200; ///< Voltage outside profile range
+static const uint16_t ALARM_ACR_ROLLOVER     = 0x0400; ///< ACR counter rolled over
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Calibration phase
 // ──────────────────────────────────────────────────────────────────────────────
-/**
- * Calibration state machine phases, readable via getCalPhase().
- * Calibration is optional; without it the library uses voltage-curve SOC only.
- */
 enum CalPhase : uint8_t {
-    CAL_NONE      = 0, ///< Normal operation - no calibration running
+    CAL_NONE      = 0, ///< Normal operation
     CAL_ZERO      = 1, ///< Sampling current offset at rest
-    CAL_WAIT      = 2, ///< Settling delay before enabling discharge load
+    CAL_WAIT      = 2, ///< Settling before discharge
     CAL_DISCHARGE = 3, ///< Discharging to empty voltage
     CAL_CHARGE    = 4, ///< Waiting for full charge
     CAL_DONE      = 5, ///< Calibration complete
-    CAL_ABORT     = 6  ///< Calibration aborted (temperature / timeout)
+    CAL_ABORT     = 6  ///< Aborted (temperature / timeout)
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Hardware pin defaults  (change with setPin*() before begin())
+// Hardware pin defaults
 // ──────────────────────────────────────────────────────────────────────────────
-static const uint8_t BMS_DEFAULT_PIN_LOAD_EN    =  5; ///< Load MOSFET / relay
-static const uint8_t BMS_DEFAULT_PIN_STATUS_LED = 13; ///< Status LED
+static const uint8_t BMS_DEFAULT_PIN_LOAD_EN    =  5;
+static const uint8_t BMS_DEFAULT_PIN_STATUS_LED = 13;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// EEPROM record for the learned resistance model.
-// Defined here (not inside the class) so sizeof() is accessible at file scope
-// in the .cpp when computing EEPROM slot addresses.
+// EEPROM record — defined outside the class so sizeof() works at file scope
 // ──────────────────────────────────────────────────────────────────────────────
 struct LearnedRecord {
     uint16_t magic;
@@ -132,226 +155,200 @@ struct LearnedRecord {
 // LTC2944_BMS class
 // ──────────────────────────────────────────────────────────────────────────────
 
-/**
- * Main BMS class.  Create one instance in your sketch.
- */
 class LTC2944_BMS {
 public:
-    // ── Construction & configuration ────────────────────────────────────────
 
     LTC2944_BMS();
 
+    // ── Configuration — call before begin() ─────────────────────────────────
+
     /**
-     * Select the battery chemistry and class (series-cell count or 12 V block
-     * count for lead-acid).
+     * Select battery chemistry and series-cell count.
      *
-     * Must be called before begin().
+     * Li-ion / LiFePO4 classCode = number of series cells:
+     *   1, 2, 3, 4, 6, 8, 12, 14
      *
-     * Li-ion / LiFePO4 classCode -> series cell count:
-     *   0 = 1S, 1 = 2S, 2 = 3S, 3 = 4S, 4 = 6S, 5 = 8S, 6 = 12S, 7 = 14S
+     * AGM / GEL classCode = pack voltage in Volts:
+     *   12, 24, 48
      *
-     * AGM / GEL classCode -> 12 V block count:
-     *   0 = 12 V, 1 = 24 V, 2 = 48 V
-     *
-     * @param chem       Battery chemistry (CHEM_LIION, CHEM_LIFEPO4, CHEM_AGM, CHEM_GEL)
-     * @param classCode  Series cell / block count selector (see above)
+     * Examples:
+     *   bms.setProfile(CHEM_LIION,    2);  // 2S Li-ion   (7.4 V nominal)
+     *   bms.setProfile(CHEM_LIFEPO4,  4);  // 4S LiFePO4  (12.8 V nominal)
+     *   bms.setProfile(CHEM_AGM,     12);  // 12 V AGM
      */
     void setProfile(BatteryChem chem, uint8_t classCode);
 
     /**
-     * Set the nominal battery capacity in mAh.
-     *
-     * Must be called before begin(). This is used to:
-     *   - Configure the LTC2944 prescaler (M) for correct ACR counting
-     *   - Report remaining capacity in mAh via getRemainingMah()
-     *   - Estimate runtime via getRuntimeMinutes()
-     *
-     * The prescaler is chosen automatically as the smallest power-of-2 value
-     * that covers the full capacity range of the ACR register for the given
-     * shunt, using the LTC2944 datasheet formula:
-     *   M = (capacityMah * shuntMilliOhm) / 40.96  (rounded up to next power of 2)
-     *
-     * @param capacityMah  Nominal battery capacity in mAh (e.g. 2000 for a 2 Ah cell)
+     * Set nominal battery capacity in mAh.
+     * Enables remaining-mAh, runtime estimation, and correct ACR prescaler.
      */
     void setCapacity(uint16_t capacityMah);
 
     /**
-     * Override the shunt resistor value.
-     * Default: 1 mOhm (0.001f) — matches the reference hardware design.
-     * Call before begin() if your hardware uses a different shunt.
-     * @param ohms  Shunt resistance in Ohms (e.g. 0.001 for 1 mOhm)
+     * Override the full-charge voltage for the pack in Volts.
+     * Useful when your charger terminates at a non-standard voltage,
+     * e.g. 8.30V instead of the profile default of 8.40V for a 2S pack.
+     * Set to 0 (default) to use the profile table value.
+     */
+    void setFullVoltage(float volts);
+
+    /**
+     * Override the empty voltage for the pack in Volts.
+     * Set to 0 (default) to use the profile table value.
+     */
+    void setEmptyVoltage(float volts);
+
+    /**
+     * Set shunt resistor value in Ohms.
+     * Default: 0.001 (1 mOhm) — matches reference hardware.
      */
     void setShuntResistor(float ohms);
 
     /**
-     * Override the GPIO pin used to drive the calibration discharge load.
-     * Default: pin 5.
+     * Set the calibration timeout in minutes.
+     * Default: 240 minutes (4 hours).
+     * Set longer for large battery packs with low discharge currents.
      */
+    void setCalibrationTimeout(uint32_t minutes);
+
+    /**
+     * Set the charge-taper current threshold for full-charge detection
+     * during calibration in Amperes.
+     * Default: 0.1 A (100 mA).
+     * Increase if your charger terminates at a higher current (e.g. 0.5 A
+     * for chargers that use the 0.1C rule with large packs).
+     * Requires CAL_FULL_CONFIRM_SAMPLES consecutive readings below this
+     * threshold before declaring full.
+     */
+    void setCalibrationFullCurrent(float amps);
+
+    /**
+     * Set the minimum current threshold to consider a charger connected
+     * during calibration, in Amperes.
+     * Default: 0.030 A (30 mA).
+     * The hard-cutoff detection path (CHG YES->NO at near-full voltage) does
+     * not use this threshold — it works regardless of this setting.
+     */
+    void setCalibrationChargerOnCurrent(float amps);
+
+    /**
+     * Set the maximum discharge current alarm threshold in Amperes.
+     * Default: 5.5 A.
+     */
+    void setMaxDischargeCurrent(float amps);
+
+    /**
+     * Set the maximum charge current alarm threshold in Amperes.
+     * Default: 3.0 A. Increase for large packs with high charge rates.
+     */
+    void setMaxChargeCurrent(float amps);
+
+    /** Select serial output format. Default: OUTPUT_SERIAL. */
+    void setOutputMode(OutputMode mode);
+
+    /** Override load-enable pin. Default: 5. */
     void setPinLoadEnable(uint8_t pin);
 
-    /**
-     * Override the GPIO pin used to drive the status LED.
-     * Default: pin 13.
-     */
+    /** Override status LED pin. Default: 13. */
     void setPinStatusLed(uint8_t pin);
 
-    /**
-     * Set a current deadband in Amperes (default 30 mA).
-     * Currents whose absolute value is below this threshold are reported as 0.
-     */
+    /** Set current deadband in Amperes. Default: 0.030 A. */
     void setCurrentDeadband(float amps);
 
-    // ── Initialisation ──────────────────────────────────────────────────────
+    // ── Initialisation ───────────────────────────────────────────────────────
 
     /**
-     * Initialise the library: Wire.begin(), EEPROM load, LTC2944 setup.
-     *
-     * Call once in setup() after setProfile(), setCapacity(), and any other
-     * setXxx() calls.
-     *
-     * @return true if the LTC2944 was found and configured successfully.
+     * Initialise the library.
+     * Call once in setup() after all setXxx() calls.
+     * @return true if LTC2944 found and configured.
      */
     bool begin();
 
-    // ── Main loop call ───────────────────────────────────────────────────────
+    // ── Main loop ────────────────────────────────────────────────────────────
 
     /**
-     * Read all LTC2944 registers, compute SOC, update alarms and learned model.
-     *
-     * Call this every loop iteration (or at whatever interval suits your sketch).
-     * The library enforces a 1-second minimum between actual sensor reads; calls
-     * within that window return false immediately.
-     *
-     * @return true when a new measurement was taken and getXxx() values are fresh.
+     * Read all LTC2944 registers and update measurements.
+     * Enforces 1-second minimum between reads.
+     * @return true when a fresh measurement is available.
      */
     bool update();
 
-    // ── Measurement accessors (valid after update() returns true) ────────────
+    // ── Output ───────────────────────────────────────────────────────────────
 
-    /** State of charge 0-100 %. */
+    /**
+     * Print latest measurement in the selected output mode.
+     * Call after update() returns true.
+     * @param port  Any Stream — Serial, Serial1, SoftwareSerial, etc.
+     */
+    void print(Stream& port);
+
+    /**
+     * Print the CSV header line.
+     * Called automatically by begin() when OUTPUT_CSV is selected.
+     */
+    void printCsvHeader(Stream& port);
+
+    // ── Measurement accessors ────────────────────────────────────────────────
+
     int      getSoc()            const;
-
-    /** Pack voltage in Volts. */
     float    getVoltage()        const;
-
-    /** Current in Amperes (positive = charging, negative = discharging). */
     float    getCurrent()        const;
-
-    /** Die temperature in degrees C. */
     float    getTemperature()    const;
-
-    /** Alarm bitfield - OR of ALARM_* constants. */
     uint16_t getAlarms()         const;
-
-    /** true while a charge current is detected. */
     bool     isCharging()        const;
-
-    /**
-     * Remaining capacity in mAh, derived from SOC and nominal capacity.
-     * Returns 0 if setCapacity() was not called.
-     */
     uint16_t getRemainingMah()   const;
-
-    /**
-     * Estimated runtime in minutes at the current discharge rate.
-     * Returns -1 if the battery is charging, current is near zero,
-     * or setCapacity() was not called.
-     */
     int16_t  getRuntimeMinutes() const;
-
-    /** Nominal capacity as set by setCapacity(), in mAh. */
     uint16_t getCapacityMah()    const;
-
-    /** Prescaler value (M) written to the LTC2944 control register. */
     uint8_t  getPrescaler()      const;
-
-    /** Copy the last full measurement struct. */
     BmsMeasurement getMeasurement() const;
 
     // ── Disconnect detection ─────────────────────────────────────────────────
 
-    /**
-     * Returns true if the library has detected a battery disconnect and written
-     * the disconnect flag to EEPROM.
-     */
     bool isBatteryDisconnected() const;
 
     // ── Calibration ─────────────────────────────────────────────────────────
 
-    /**
-     * Start the automatic calibration sequence.
-     * The load pin will be driven HIGH during the discharge phase.
-     * Monitor getCalPhase() to track progress.
-     */
-    void startCalibration();
+    void     startCalibration();
+    void     stopCalibration();
+    CalPhase getCalPhase()  const;
+    bool     isCalibrated() const;
+    void     resetCalibration();
 
-    /** Stop / abort any running calibration. */
-    void stopCalibration();
+    // ── Learned model ────────────────────────────────────────────────────────
 
-    /** Current calibration phase. */
-    CalPhase getCalPhase() const;
-
-    /** True if calibration data (empty/full voltage + ACR window) is available. */
-    bool isCalibrated() const;
-
-    /** Erase all calibration data from EEPROM and RAM. */
-    void resetCalibration();
-
-    // ── Learned internal-resistance model ────────────────────────────────────
-
-    /**
-     * Current learned internal resistance in Ohms.
-     * Returns the conservative default (80 mOhm) until confidence >= 0.10.
-     */
-    float getLearnedResistance() const;
-
-    /**
-     * Confidence of the learned resistance model, 0.0-1.0.
-     * Reaches 1.0 after approximately 12 good current-step samples.
-     */
+    float getLearnedResistance()  const;
     float getLearningConfidence() const;
-
-    /**
-     * Call this when a new battery is fitted.
-     * Resets the learned model and calibration data.
-     */
-    void resetForNewBattery();
+    void  resetForNewBattery();
 
     // ── Utility ──────────────────────────────────────────────────────────────
 
-    /**
-     * Returns the name string of the resolved battery profile,
-     * e.g. "LIION_1S".  Returns "INVALID" if the profile is not found.
-     */
-    const char* getProfileName() const;
-
-    /** True if the measured voltage is within the plausibility window of the profile. */
-    bool isProfilePlausible() const;
-
-    /**
-     * Re-initialise the LTC2944 over I2C (useful after a transient I2C error).
-     * @return true on success.
-     */
-    bool reinitChip();
+    const char* getProfileName()     const;
+    bool        isProfilePlausible() const;
+    bool        reinitChip();
 
     // ──────────────────────────────────────────────────────────────────────────
-    // Private implementation
+    // Private
     // ──────────────────────────────────────────────────────────────────────────
 private:
 
-    // ── Hardware config ──────────────────────────────────────────────────────
+    // Config
     BatteryChem _chem;
     uint8_t     _classCode;
     float       _shuntOhm;
+    float       _overrideFullV;   // 0 = use profile
+    float       _overrideEmptyV;  // 0 = use profile
     uint8_t     _pinLoadEn;
     uint8_t     _pinStatusLed;
     float       _currentDeadbandA;
+    uint16_t    _capacityMah;
+    uint8_t     _prescaler;
+    OutputMode  _outputMode;
+    uint32_t    _calTimeoutMs;
+    float       _calFullCurrentA;
+    float       _maxDischargeA;
+    float       _maxChargeA;
 
-    // ── Capacity ─────────────────────────────────────────────────────────────
-    uint16_t    _capacityMah;  // 0 = not set
-    uint8_t     _prescaler;    // LTC2944 prescaler M (1, 2, 4, 8, 16, 32, 64, 128)
-
-    // ── Live state ───────────────────────────────────────────────────────────
+    // Live state
     BmsMeasurement _meas;
     bool        _disconnected;
     bool        _profileMismatch;
@@ -367,7 +364,20 @@ private:
     uint8_t     _disconnectCandidateCount;
     uint8_t     _i2cFailCount;
 
-    // ── Profile ──────────────────────────────────────────────────────────────
+    // Full-charge confirmation (multiple samples to avoid false triggers)
+    uint8_t     _calFullConfirmCount;
+
+    // Hard-cutoff charger detection
+    // Some chargers cut power abruptly at full rather than tapering current.
+    // We detect this by watching for CHG YES->NO transition at near-full voltage.
+    bool        _prevCharging;          // charging state from previous cycle
+    float       _calChargerOnCurrentA;  // configurable charger-on threshold
+
+    // ACR rollover tracking
+    uint16_t    _lastRawACR;
+    bool        _acrRollover;
+
+    // Profile
     struct BatteryProfileInternal {
         bool        valid;
         BatteryChem chem;
@@ -380,7 +390,7 @@ private:
     BatteryProfileInternal _profile;
     char _profileNameBuf[16];
 
-    // ── Calibration data ─────────────────────────────────────────────────────
+    // Calibration
     struct CalData {
         float    vEmpty, vFull;
         uint16_t emptyChargeRaw, fullChargeRaw;
@@ -388,7 +398,7 @@ private:
     };
     CalData _cal;
 
-    // ── Learned resistance model ─────────────────────────────────────────────
+    // Learned model
     struct LearnedModel {
         float    resistance;
         float    confidence;
@@ -411,8 +421,9 @@ private:
     uint32_t      _lastLearnedSaveMs;
     uint32_t      _lastRelaxedSeenMs;
 
-    // ── Private methods ───────────────────────────────────────────────────────
+    // Private methods
     bool     _writeReg8(uint8_t reg, uint8_t val);
+    bool     _writeReg16(uint8_t reg, uint16_t val);
     bool     _readReg8(uint8_t reg, uint8_t& val);
     bool     _readReg16(uint8_t reg, uint16_t& val);
 
@@ -422,11 +433,16 @@ private:
     float    _rawToTemperature(uint16_t raw) const;
     float    _rawAcrToMah(uint16_t raw) const;
 
+    // Effective full/empty voltages (override or profile)
+    float    _effectiveVFull()  const;
+    float    _effectiveVEmpty() const;
+
     uint8_t  _computePrescaler() const;
     bool     _writePrescaler(uint8_t m);
 
     void     _resolveProfile();
     bool     _isVoltagePlausible(float v) const;
+    bool     _checkAcrRollover(uint16_t rawACR);
     int      _estimateSoc(float vbat, float currentA, uint16_t rawACR, bool charging);
     int      _socFromVoltageCurve(float vbat, float currentA, uint16_t rawACR, bool charging,
                                    float chargeCompV, int lowerBandSoc, int upperBandSoc);
