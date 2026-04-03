@@ -52,10 +52,10 @@ void setup() {
     //     bms.setProfile(CHEM_AGM, 24);       // 24 V
     //     bms.setProfile(CHEM_GEL, 48);       // 48 V
     //
-    bms.setProfile(CHEM_LIION, 1);      // <- change to match your battery
+    bms.setProfile(CHEM_LIION, 2);      // 2S Li-ion
 
     // ── 2. Set battery capacity in mAh ──────────────────────────────────────
-    bms.setCapacity(2000);              // <- change to match your battery
+    bms.setCapacity(280);              // 280 mAh
 
     // ── 3. Set shunt resistor value ─────────────────────────────────────────
     bms.setShuntResistor(0.001f);       // 1 mOhm — reference hardware
