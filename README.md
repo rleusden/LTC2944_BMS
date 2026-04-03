@@ -3,7 +3,8 @@
 An Arduino library for the **LTC2944 battery gas gauge IC**, supporting Li-ion,
 LiFePO4, AGM, and GEL battery packs across a wide range of series-cell configurations.
 
-Designed for **ATmega328P** boards (Arduino Pro Mini, Nano, Uno).
+Versions 1.x.x Designed for **ATmega328P** boards (Arduino Pro Mini, Nano, Uno).
+Upcoming versions 2.x.x Designed for the Raspberry Pi Pico mini RP2040-Zero
 
 [![Arduino Library Manager](https://img.shields.io/badge/Arduino-Library%20Manager-blue)](https://www.arduino.cc/reference/en/libraries/ltc2944_bms/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
