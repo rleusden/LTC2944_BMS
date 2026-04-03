@@ -151,6 +151,7 @@ LTC2944_BMS::LTC2944_BMS()
     , _calChargerOnCurrentA(0.030f)
     , _lastRawACR(0)
     , _acrRollover(false)
+    , _acrBootTicks(3)
     , _profile{}
     , _profileNameBuf{}
     , _cal{}
@@ -185,7 +186,10 @@ void LTC2944_BMS::setCurrentDeadband(float a)      { _currentDeadbandA = a; }
 
 float LTC2944_BMS::_effectiveVFull() const {
     if (_overrideFullV > 0.0f) return _overrideFullV;
-    if (_cal.valid && isfinite(_cal.vFull)) return _cal.vFull;
+    // isfinite(0.0f) is true, so guard against zero explicitly.
+    // _cal.vFull is 0.0f until the full anchor is saved at end of CAL_CHARGE,
+    // so returning it early would make nearFull checks fire at any voltage.
+    if (_cal.valid && _cal.vFull > 0.0f) return _cal.vFull;
     return _profile.valid ? _profile.vFull : 0.0f;
 }
 
@@ -256,7 +260,38 @@ bool LTC2944_BMS::begin() {
 
     if (_outputMode == OUTPUT_CSV) printCsvHeader(Serial);
 
-    return reinitChip();
+    bool ok = reinitChip();
+
+    // Seed the ACR register to a position matching the voltage-estimated SOC.
+    // After a flash or power cycle the LTC2944 resets ACR to 0x7FFF (mid-scale)
+    // which has no relation to actual charge state. We read the current voltage,
+    // estimate SOC from the voltage curve, then write ACR to the proportional
+    // position within the calibrated empty..full window.
+    // This gives the coulomb counter a meaningful starting point so the blend
+    // is immediately sensible rather than jumping once the settle window expires.
+    // If calibration is not yet valid we leave ACR at chip default and rely on
+    // voltage-only SOC until calibration completes.
+    if (_cal.valid && _cal.hasEmptyRaw && _cal.hasFullRaw) {
+        uint16_t rawVoltBoot = 0;
+        if (_readReg16(REG_VOLTAGE_MSB, rawVoltBoot)) {
+            float vBoot = _rawToVoltage(rawVoltBoot);
+            // Crude linear voltage SOC (no IR comp, no current yet)
+            float vEmpty = _effectiveVEmpty();
+            float vFull  = _effectiveVFull();
+            float socFrac = 0.0f;
+            if (vFull > vEmpty + 0.1f)
+                socFrac = _clampf((vBoot - vEmpty) / (vFull - vEmpty), 0.0f, 1.0f);
+            long span    = (long)_cal.fullChargeRaw - (long)_cal.emptyChargeRaw;
+            uint16_t acrSeed = (uint16_t)(_cal.emptyChargeRaw + (long)(socFrac * (float)span));
+            _writeACR(acrSeed);
+            _lastRawACR = acrSeed;
+        }
+    }
+    // Use voltage-only SOC for the first 3 update() ticks while the ACR
+    // register settles and the current measurement stabilises.
+    _acrBootTicks = 3;
+
+    return ok;
 }
 
 bool LTC2944_BMS::reinitChip() {
@@ -355,6 +390,94 @@ bool LTC2944_BMS::update() {
 // Output
 // ──────────────────────────────────────────────────────────────────────────────
 
+void LTC2944_BMS::printDebug(Stream& port) {
+    port.println(F("\n=== LTC2944_BMS DEBUG ==="));
+
+    // -- EEPROM: current offset
+    uint32_t offMagic = 0; EEPROM.get(EE_MAGIC, offMagic);
+    port.print(F("EEPROM offset magic : 0x")); port.println(offMagic, HEX);
+    if (offMagic == EEPROM_MAGIC) {
+        float off = 0.0f; EEPROM.get(EE_OFFSET, off);
+        port.print(F("Current offset      : ")); port.print(off, 2); port.println(F(" mA"));
+    } else {
+        port.println(F("Current offset      : (not saved)"));
+    }
+
+    // -- EEPROM: calibration
+    uint32_t calMagic = 0; EEPROM.get(EE_CAL_MAGIC, calMagic);
+    port.print(F("EEPROM cal magic    : 0x")); port.println(calMagic, HEX);
+    if (calMagic == CAL_MAGIC) {
+        float vE = 0.0f, vF = 0.0f;
+        EEPROM.get(EE_CAL_EMPTY_V, vE);
+        EEPROM.get(EE_CAL_FULL_V,  vF);
+        port.print(F("Cal vEmpty          : ")); port.println(vE, 4);
+        port.print(F("Cal vFull           : ")); port.println(vF, 4);
+
+        uint16_t emMagic = 0, fuMagic = 0;
+        EEPROM.get(EE_CAL_EMPTY_MAGIC, emMagic);
+        EEPROM.get(EE_CAL_FULL_MAGIC,  fuMagic);
+        port.print(F("Empty ACR magic     : 0x")); port.println(emMagic, HEX);
+        port.print(F("Full  ACR magic     : 0x")); port.println(fuMagic, HEX);
+
+        if (emMagic == EMPTY_ACR_MAGIC) {
+            uint16_t eRaw = 0; EEPROM.get(EE_CAL_EMPTY_RAW, eRaw);
+            port.print(F("Cal emptyChargeRaw  : 0x")); port.println(eRaw, HEX);
+        } else {
+            port.println(F("Cal emptyChargeRaw  : (magic bad)"));
+        }
+        if (fuMagic == FULL_ACR_MAGIC) {
+            uint16_t fRaw = 0; EEPROM.get(EE_CAL_FULL_RAW, fRaw);
+            port.print(F("Cal fullChargeRaw   : 0x")); port.println(fRaw, HEX);
+        } else {
+            port.println(F("Cal fullChargeRaw   : (magic bad)"));
+        }
+    } else {
+        port.println(F("Calibration         : (not saved)"));
+    }
+
+    // -- RAM calibration struct
+    port.print(F("_cal.valid          : ")); port.println(_cal.valid);
+    port.print(F("_cal.hasEmptyRaw    : ")); port.println(_cal.hasEmptyRaw);
+    port.print(F("_cal.hasFullRaw     : ")); port.println(_cal.hasFullRaw);
+    port.print(F("_cal.vEmpty         : ")); port.println(_cal.vEmpty, 4);
+    port.print(F("_cal.vFull          : ")); port.println(_cal.vFull,  4);
+    port.print(F("_cal.emptyChargeRaw : 0x")); port.println(_cal.emptyChargeRaw, HEX);
+    port.print(F("_cal.fullChargeRaw  : 0x")); port.println(_cal.fullChargeRaw,  HEX);
+
+    // -- Live chip registers
+    uint16_t liveACR = 0, liveV = 0, liveI = 0;
+    bool acrOk = _readReg16(REG_ACC_CHARGE_MSB, liveACR);
+    bool vOk   = _readReg16(REG_VOLTAGE_MSB,    liveV);
+    bool iOk   = _readReg16(REG_CURRENT_MSB,    liveI);
+    port.print(F("Live ACR register   : "));
+    if (acrOk) { port.print(F("0x")); port.println(liveACR, HEX); }
+    else          port.println(F("(read failed)"));
+    port.print(F("Live voltage raw    : "));
+    if (vOk)   { port.print(F("0x")); port.print(liveV, HEX);
+                 port.print(F("  (")); port.print(_rawToVoltage(liveV), 3); port.println(F(" V)")); }
+    else          port.println(F("(read failed)"));
+    port.print(F("Live current raw    : "));
+    if (iOk)   { port.print(F("0x")); port.println(liveI, HEX); }
+    else          port.println(F("(read failed)"));
+
+    // -- ACR seed result
+    port.print(F("_lastRawACR (seed)  : 0x")); port.println(_lastRawACR, HEX);
+    port.print(F("_acrBootTicks left  : ")); port.println(_acrBootTicks);
+
+    // Raw EEPROM byte dump around cal region
+    port.println(F("--- Raw EEPROM 0x20..0x33 ---"));
+    for (int addr = 0x20; addr <= 0x33; addr++) {
+        uint8_t b = EEPROM.read(addr);
+        port.print(F("0x")); 
+        if (addr < 0x10) port.print(F("0"));
+        port.print(addr, HEX);
+        port.print(F(": 0x"));
+        if (b < 0x10) port.print(F("0"));
+        port.println(b, HEX);
+    }
+    port.println(F("=========================\n"));
+}
+
 void LTC2944_BMS::printCsvHeader(Stream& port) {
     port.println(F("soc_%,voltage_V,current_mA,temp_C,charging,remaining_mAh,runtime_min,alarms"));
 }
@@ -444,7 +567,20 @@ bool           LTC2944_BMS::isBatteryDisconnected() const { return _disconnected
 // Calibration
 // ──────────────────────────────────────────────────────────────────────────────
 
-void LTC2944_BMS::startCalibration() { _calibrationMode = true;  _calFullConfirmCount = 0; _enterCalPhase(CAL_ZERO); }
+void LTC2944_BMS::startCalibration() {
+    _calibrationMode = true;
+    _calFullConfirmCount = 0;
+    // Clear any previous calibration anchors so fullNotYetSaved is true
+    // throughout the new run. Stale anchors from a previous calibration
+    // would block PATH B and PATH A from saving new values.
+    resetCalibration();
+    // Reset the current offset to zero before the zero phase begins.
+    // Any previously stored offset would corrupt the charger-on safety check
+    // and the zero-sample accumulation, since currentA is offset-corrected.
+    _currentOffset_mA = 0.0f;
+    _saveOffset(0.0f);
+    _enterCalPhase(CAL_ZERO);
+}
 void LTC2944_BMS::stopCalibration()  { _calibrationMode = false; _enterCalPhase(CAL_NONE); }
 CalPhase LTC2944_BMS::getCalPhase()  const { return _calPhase; }
 
@@ -482,6 +618,21 @@ bool        LTC2944_BMS::isProfilePlausible() const { return !_profileMismatch; 
 // ──────────────────────────────────────────────────────────────────────────────
 // I2C helpers
 // ──────────────────────────────────────────────────────────────────────────────
+
+// Shutdown-safe ACR write.
+// The LTC2944 datasheet requires B[0]=1 (shutdown) before writing the ACR
+// register (C/D) to avoid a race with the internal delta-sigma integrator.
+// We read the current control register, set the shutdown bit, write ACR,
+// then restore the original control value.
+bool LTC2944_BMS::_writeACR(uint16_t val) {
+    uint8_t ctrl = 0;
+    if (!_readReg8(REG_CONTROL, ctrl)) return false;
+    if (!_writeReg8(REG_CONTROL, ctrl | 0x01)) return false;  // assert shutdown
+    delay(1);
+    bool ok = _writeReg16(REG_ACC_CHARGE_MSB, val);
+    _writeReg8(REG_CONTROL, ctrl);                             // restore (clears shutdown)
+    return ok;
+}
 
 bool LTC2944_BMS::_writeReg8(uint8_t reg, uint8_t val) {
     Wire.beginTransmission(LTC2944_ADDR);
@@ -583,6 +734,20 @@ bool LTC2944_BMS::_isVoltagePlausible(float v) const {
 int LTC2944_BMS::_estimateSoc(float vbat, float currentA, uint16_t rawACR, bool charging) {
     if (!_profile.valid || _profile.seriesCount == 0) return 0;
 
+    // During the boot-settle window the ACR register may not have integrated
+    // away from chip reset default yet. Use voltage-only SOC and pass the
+    // saved full-charge anchor as rawACR so the emptyRaw guard in
+    // _socFromVoltageCurve cannot force SOC=0 on a good battery voltage.
+    if (_acrBootTicks > 0) {
+        _acrBootTicks--;
+        uint16_t safeACR = (_cal.valid && _cal.hasFullRaw) ? _cal.fullChargeRaw : rawACR;
+        switch (_profile.chem) {
+            case CHEM_LIION:   return _socFromVoltageCurve(vbat, currentA, safeACR, charging, 0.03f, 40, 100);
+            case CHEM_LIFEPO4: return _socFromVoltageCurve(vbat, currentA, safeACR, charging, 0.02f, 35, 100);
+            default:           return _socFromVoltageCurve(vbat, currentA, safeACR, charging, 0.10f, 50, 100);
+        }
+    }
+
     // If ACR rolled over, fall back to voltage-only SOC until recalibrated
     if (_acrRollover) {
         switch (_profile.chem) {
@@ -679,7 +844,16 @@ uint16_t LTC2944_BMS::_makeAlarms(float v, float i, float t, bool sensorOk) cons
         bool voltageWindowValid = (vFull > vEmpty + 0.5f);
         if (voltageWindowValid) {
             if (v < vEmpty)  a |= ALARM_UNDER_VOLTAGE;
-            if (v > vFull)   a |= ALARM_OVER_VOLTAGE;
+            // OV threshold: calibrated vFull is the observed charger-cutoff
+            // voltage, not a hard ceiling. The pack voltage can exceed it by a
+            // small amount while the charger is still in the CV phase, or when
+            // a hard-cutoff charger reconnects. Add a per-cell margin (50 mV)
+            // so the alarm only fires if the voltage is genuinely anomalous.
+            // If no calibration is active the profile vFull is used directly
+            // (it already carries headroom from the profile definition).
+            float seriesN  = (_profile.seriesCount > 0) ? (float)_profile.seriesCount : 1.0f;
+            float vFullAlarm = vFull + (0.05f * seriesN);
+            if (v > vFullAlarm)  a |= ALARM_OVER_VOLTAGE;
         }
         if (v < _profile.vAbsLow)   a |= ALARM_ABS_UNDER_V;
         if (v > _profile.vAbsHigh)  a |= ALARM_ABS_OVER_V;
@@ -732,7 +906,21 @@ void LTC2944_BMS::_enterCalPhase(CalPhase phase) {
             _calFullConfirmCount = 0;
             _setLoad(false); break;
         case CAL_WAIT:      _setLoad(false); break;
-        case CAL_DISCHARGE: _calRunStartMs = millis(); _setLoad(true); break;
+        case CAL_DISCHARGE:
+            // Preset ACR to mid-scale before discharge begins. This maximises
+            // headroom in both directions and prevents rollover on small or
+            // high-IR packs that drain quickly from a low starting ACR position.
+            // The empty anchor is saved as whatever value ACR reaches at vEmpty,
+            // measured downward from 0x7FFF — always a valid decreasing count.
+            _writeACR(0x7FFF);
+            _acrRollover = false;
+            _calRunStartMs = millis();
+            _setLoad(true);
+            break;
+        case CAL_CHARGE:
+            _calPeakChargeV = 0.0f;
+            _setLoad(false);
+            break;
         default:            _setLoad(false); break;
     }
 }
@@ -782,6 +970,11 @@ void LTC2944_BMS::_updateCalibration(uint16_t rawCurr, uint16_t rawACR,
 
     switch (_calPhase) {
         case CAL_ZERO: {
+            // Wait CAL_SETTLE_MS before taking samples. This lets any residual
+            // charger tail current or load transient decay to zero so the offset
+            // measurement reflects true no-current conditions.
+            if ((uint32_t)(millis() - _calPhaseStartMs) < CAL_SETTLE_MS) break;
+
             _zeroAccumRawDelta += (int32_t)rawCurr - 32767;
             if (++_zeroSamplesTaken >= ZERO_SAMPLES) {
                 float avgDelta = (float)_zeroAccumRawDelta / (float)_zeroSamplesTaken;
@@ -806,6 +999,11 @@ void LTC2944_BMS::_updateCalibration(uint16_t rawCurr, uint16_t rawACR,
             }
             break;
         case CAL_CHARGE: {
+            // Safety backstop: keep load off throughout the charge phase.
+            // _enterCalPhase already called _setLoad(false) but the hardware
+            // may not respond instantly. Repeating it each tick costs nothing.
+            _setLoad(false);
+
             // Two detection paths for full-charge:
             //
             // PATH A — CV taper (standard chargers):
@@ -821,8 +1019,32 @@ void LTC2944_BMS::_updateCalibration(uint16_t rawCurr, uint16_t rawACR,
             float vFull    = _effectiveVFull();
             bool  nearFull = _profile.valid && vbat >= (vFull * CAL_FULL_VOLT_PCT);
 
+            // Track the highest voltage seen during this charge phase.
+            // Used by PATH B as a charger-agnostic full indicator: if voltage
+            // drops from the observed peak the charger has cut off, regardless
+            // of whether the pack reached the profile vFull.
+            if (vbat > _calPeakChargeV) _calPeakChargeV = vbat;  // high-water mark
+
+            // nearFull: profile threshold OR voltage has pulled back >20mV from
+            // the observed charge peak (charger cut off below profile vFull).
+            // The 0.95*vFull guard prevents triggering during early charge when
+            // the peak is still low.
+            bool peakDropped = (_calPeakChargeV > (vFull * 0.95f))
+                            && (vbat < (_calPeakChargeV - 0.020f));
+            nearFull = nearFull || peakDropped;
+
             // PATH B — hard-cutoff detection
-            if (_prevCharging && !_charging && nearFull) {
+            // A genuine hard cutoff means the charger physically disconnected:
+            // current must be zero (within deadband), not merely below the
+            // taper threshold. This prevents a balance pulse or a brief
+            // measurement dip from triggering a false full-charge anchor.
+            bool currentZero = (currentA == 0.0f);  // deadband already applied in _rawToCurrent
+            // Also require that no full anchor has been saved yet. Without this,
+            // a load cutoff at empty (where _cal.vFull is still 0.0f and
+            // nearFull would be true for any voltage) could trigger PATH B.
+            bool fullNotYetSaved = !_cal.hasFullRaw;
+
+            if (_prevCharging && !_charging && nearFull && currentZero && fullNotYetSaved) {
                 Serial.println(F("# Cal: hard-cutoff charger detected — saving full anchor."));
                 _saveCalFull(vbat, rawACR);
                 _enterCalPhase(CAL_DONE);
@@ -885,18 +1107,28 @@ void LTC2944_BMS::_loadCalibration() {
 
     // ── Sanity check — auto-reset if data is obviously corrupt ───────────────
     // Any of these conditions indicate a failed or partial calibration run:
-    //   1. vEmpty or vFull are not finite numbers
-    //   2. vFull <= vEmpty  (full voltage must be higher than empty voltage)
-    //   3. vFull and vEmpty difference is less than 0.5V  (implausibly narrow window)
-    //   4. Both ACR anchors are present but identical (saved at same point)
-    //   5. Either voltage is negative or unrealistically high (>80V)
+    //   1. vEmpty is not a finite number
+    //   2. vEmpty is negative or unrealistically high (>80V)
+    //   3. If full anchor present: vFull not finite, <= vEmpty, window < 0.5V,
+    //      vFull > 80V, or ACR anchors inverted/identical
+    // NOTE: vFull checks are only applied when hasFullRaw is true. A partially
+    // complete calibration (empty saved, full not yet saved) is valid — vFull
+    // will be 0.0f from EEPROM uninitialised memory and must not be validated.
     bool corrupt = false;
-    if (!isfinite(_cal.vEmpty) || !isfinite(_cal.vFull))   corrupt = true;
-    if (_cal.vFull <= _cal.vEmpty)                         corrupt = true;
-    if ((_cal.vFull - _cal.vEmpty) < 0.5f)                corrupt = true;
-    if (_cal.vEmpty < 0.0f || _cal.vFull > 80.0f)         corrupt = true;
-    if (_cal.hasEmptyRaw && _cal.hasFullRaw &&
-        _cal.fullChargeRaw == _cal.emptyChargeRaw)         corrupt = true;
+    if (!isfinite(_cal.vEmpty))                            corrupt = true;
+    if (_cal.vEmpty < 0.0f || _cal.vEmpty > 80.0f)        corrupt = true;
+    if (_cal.hasFullRaw) {
+        if (!isfinite(_cal.vFull))                         corrupt = true;
+        if (_cal.vFull <= _cal.vEmpty)                     corrupt = true;
+        if ((_cal.vFull - _cal.vEmpty) < 0.5f)            corrupt = true;
+        if (_cal.vFull > 80.0f)                            corrupt = true;
+        if (_cal.hasEmptyRaw &&
+            _cal.fullChargeRaw == _cal.emptyChargeRaw)     corrupt = true;
+        // ACR counts DOWN during discharge so fullChargeRaw must be greater
+        // than emptyChargeRaw. Inverted window = old firmware anchor.
+        if (_cal.hasEmptyRaw &&
+            _cal.fullChargeRaw <= _cal.emptyChargeRaw)     corrupt = true;
+    }
 
     if (corrupt) {
         _cal = {};   // clear in RAM
@@ -907,27 +1139,41 @@ void LTC2944_BMS::_loadCalibration() {
 }
 
 void LTC2944_BMS::_saveCalEmpty(float v, uint16_t raw) {
-    _cal.vEmpty = v; _cal.emptyChargeRaw = raw; _cal.hasEmptyRaw = true; _cal.valid = true;
-    EEPROM.put(EE_CAL_MAGIC, CAL_MAGIC); EEPROM.put(EE_CAL_EMPTY_V, v);
-    EEPROM.put(EE_CAL_EMPTY_RAW, raw);  EEPROM.put(EE_CAL_EMPTY_MAGIC, EMPTY_ACR_MAGIC);
+    // Park the ACR register away from the 0x0000 boundary to prevent bottom
+    // rollover. When the battery is empty the ACR is near 0x0000 — if charge
+    // starts immediately the counter can underflow to 0xFFFF making SOC jump
+    // to 100%. Parking at 0x0060 gives ~96 LSB of headroom before rollover.
+    //
+    // IMPORTANT: we save the parked value (0x0060) as the EEPROM anchor, not
+    // the measured raw. The chip register and the saved anchor must always
+    // agree so that _estimateCoulombSoc is consistent from the very first read
+    // after boot or after flashing new firmware.
+    static const uint16_t PARK_EMPTY = 0x0060;
+    _writeACR(PARK_EMPTY);
 
-    // Preset ACR away from the 0x0000 boundary to prevent bottom rollover.
-    // When the battery is empty the ACR is near 0x0000 — if charge starts
-    // immediately the counter can underflow to 0xFFFF making SOC jump to 100%.
-    // Parking at 0x0060 gives ~96 LSB of headroom before rollover.
-    _writeReg16(REG_ACC_CHARGE_MSB, 0x0060);
+    _cal.vEmpty = v; _cal.emptyChargeRaw = PARK_EMPTY; _cal.hasEmptyRaw = true; _cal.valid = true;
+    EEPROM.put(EE_CAL_MAGIC, CAL_MAGIC); EEPROM.put(EE_CAL_EMPTY_V, v);
+    EEPROM.put(EE_CAL_EMPTY_RAW, PARK_EMPTY); EEPROM.put(EE_CAL_EMPTY_MAGIC, EMPTY_ACR_MAGIC);
+    (void)raw;  // raw (pre-park) discarded — parked value is the reference
 }
 
 void LTC2944_BMS::_saveCalFull(float v, uint16_t raw) {
-    _cal.vFull = v; _cal.fullChargeRaw = raw; _cal.hasFullRaw = true; _cal.valid = true;
-    EEPROM.put(EE_CAL_MAGIC, CAL_MAGIC); EEPROM.put(EE_CAL_FULL_V, v);
-    EEPROM.put(EE_CAL_FULL_RAW, raw);   EEPROM.put(EE_CAL_FULL_MAGIC, FULL_ACR_MAGIC);
+    // Park the ACR register away from the 0xFFFF boundary to prevent top
+    // rollover. When the battery is full the ACR is near 0xFFFF — if discharge
+    // starts immediately the counter can overflow to 0x0000 making SOC jump
+    // to 0%. Parking at 0xFF9F gives ~96 LSB of headroom before rollover.
+    //
+    // IMPORTANT: we save the parked value (0xFF9F) as the EEPROM anchor, not
+    // the measured raw. The chip register and the saved anchor must always
+    // agree so that _estimateCoulombSoc is consistent from the very first read
+    // after boot or after flashing new firmware.
+    static const uint16_t PARK_FULL = 0xFF9F;
+    _writeACR(PARK_FULL);
 
-    // Preset ACR away from the 0xFFFF boundary to prevent top rollover.
-    // When the battery is full the ACR is near 0xFFFF — if discharge starts
-    // immediately the counter can overflow to 0x0000 making SOC jump to 0%.
-    // Parking at 0xFF9F gives ~96 LSB of headroom before rollover.
-    _writeReg16(REG_ACC_CHARGE_MSB, 0xFF9F);
+    _cal.vFull = v; _cal.fullChargeRaw = PARK_FULL; _cal.hasFullRaw = true; _cal.valid = true;
+    EEPROM.put(EE_CAL_MAGIC, CAL_MAGIC); EEPROM.put(EE_CAL_FULL_V, v);
+    EEPROM.put(EE_CAL_FULL_RAW, PARK_FULL); EEPROM.put(EE_CAL_FULL_MAGIC, FULL_ACR_MAGIC);
+    (void)raw;  // raw (pre-park) discarded — parked value is the reference
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

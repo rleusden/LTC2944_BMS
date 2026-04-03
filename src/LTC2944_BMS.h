@@ -288,6 +288,12 @@ public:
      */
     void printCsvHeader(Stream& port);
 
+    /**
+     * Print a diagnostic dump: EEPROM calibration values, ACR seed, and
+     * live register reads. Call once after begin() during debugging.
+     */
+    void printDebug(Stream& port);
+
     // ── Measurement accessors ────────────────────────────────────────────────
 
     int      getSoc()            const;
@@ -372,10 +378,16 @@ private:
     // We detect this by watching for CHG YES->NO transition at near-full voltage.
     bool        _prevCharging;          // charging state from previous cycle
     float       _calChargerOnCurrentA;  // configurable charger-on threshold
+    float       _calPeakChargeV;          // highest voltage seen during CAL_CHARGE
 
     // ACR rollover tracking
     uint16_t    _lastRawACR;
     bool        _acrRollover;
+
+    // Boot-settle guard: ticks remaining before ACR is considered valid.
+    // Voltage-only SOC is used during this window to prevent the chip reset
+    // default (0x7FFF) from polluting the coulomb blend.
+    uint8_t     _acrBootTicks;
 
     // Profile
     struct BatteryProfileInternal {
@@ -425,6 +437,7 @@ private:
     bool     _writeReg8(uint8_t reg, uint8_t val);
     bool     _writeReg16(uint8_t reg, uint16_t val);
     bool     _readReg8(uint8_t reg, uint8_t& val);
+    bool     _writeACR(uint16_t val);   ///< Shutdown-safe ACR write (B[0]=1 before, restore after)
     bool     _readReg16(uint8_t reg, uint16_t& val);
 
     float    _rawToVoltage(uint16_t raw) const;
