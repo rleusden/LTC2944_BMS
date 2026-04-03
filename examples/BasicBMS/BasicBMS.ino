@@ -41,12 +41,12 @@ void setup() {
     //     bms.setProfile(CHEM_AGM, 24);       // 24 V
     //     bms.setProfile(CHEM_GEL, 48);       // 48 V
     //
-    bms.setProfile(CHEM_LIION, 1);      // <- change to match your battery
+    bms.setProfile(CHEM_LIION, 2);      // 2S Li-ion (7.4 V nominal)
 
     // ── 2. Set battery capacity in mAh ──────────────────────────────────────
     //   This enables remaining-mAh and runtime estimation, and sets the
     //   correct LTC2944 prescaler for accurate coulomb counting.
-    bms.setCapacity(2000);              // <- change to match your battery
+    bms.setCapacity(4200);              // 4200 mAh
 
     // ── 3. Set shunt resistor value ─────────────────────────────────────────
     //   The reference PCB uses a 1 mOhm shunt (R1).
@@ -96,6 +96,7 @@ void setup() {
         Serial.println(F("No calibration — voltage-curve SOC only."));
         Serial.println(F("Run the Calibration example for improved accuracy."));
     }
+
     Serial.println();
 }
 
