@@ -5,7 +5,10 @@ LiFePO4, AGM, and GEL battery packs across a wide range of series-cell configura
 
 Versions 1.x.x Designed for **ATmega328P** boards (Arduino Pro Mini, Nano, Uno).
 
-Upcoming versions 2.x.x Designed for the Raspberry Pi Pico mini RP2040-Zero.
+Upcoming versions 2.x.x Designed for the Raspberry RP2040-Zero.
+
+All versions are based on functionality found in commercial BMS systems from Victron, Mastervolt, and so on.
+The excellent article ["A Closer Look at State of Charge (SOC) and State of Health (SOH) Estimation Techniques for Batteries from Analog Devices"](https://www.analog.com/en/resources/technical-articles/a-closer-look-at-state-of-charge-and-state-health-estimation-tech.html) has also inspired me.
 
 [![Arduino Library Manager](https://img.shields.io/badge/Arduino-Library%20Manager-blue)](https://www.arduino.cc/reference/en/libraries/ltc2944_bms/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -24,6 +27,17 @@ Upcoming versions 2.x.x Designed for the Raspberry Pi Pico mini RP2040-Zero.
 - Calibration state machine: zero offset → discharge to empty → charge to full
 - Alarm bitfield for over/under voltage, temperature, over-current, and profile mismatch
 - All battery profiles stored in flash (PROGMEM) to conserve RAM
+
+## Currently being tested, part of v1.9.x
+
+- Temperature capacity derating
+RemainingMah and runtimeMinutes are scaled by a piecewise-linear derating factor: −20 °C → 60 %, 25 °C → 100 %, 60 °C → 95 %. SOC itself is unaffected; only derived energy outputs are derated.
+- SOH (State of Health) estimation
+Measured Cmax (from the ACR span between empty and full calibration anchors) is compared to rated capacity at the end of each full calibration cycle. SOH % persisted to EEPROM. Exposed via getSoh() and BmsMeasurement.soh
+- Self-discharge correction
+A configurable rate (mAh/hour, default 0.05 ≈ 1 %/month on 3 Ah) is subtracted from the eta-corrected accumulator each update tick. Configurable via setSelfDischargeRate(). Set 0 to disable.
+- Coulombic efficiency (η) correction
+Separate charge and discharge efficiency factors (default ηc = 0.99, ηd = 1.00) are applied to a floating-point ACR shadow register. Prevents SOC drift from round-trip losses over many cycles. Configurable via setEfficiency().
 
 ---
 
