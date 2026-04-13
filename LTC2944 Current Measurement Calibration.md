@@ -77,6 +77,8 @@ RSENSE_OHM = 0.000978f;
 |8.00	|-7.985781|	14.2|	0.18%|
 |10.00|-9.999587|	0.4|	0.004%|
 |20.00|-20.033123|	33.1|	0.17%|
+|25.00|-25.049892|	49.8|	0.20%|
+|30.00|-30.066659|	66.6|	0.22%|
 
 Observations:
 - Measurement error is small and consistent
@@ -85,7 +87,7 @@ Observations:
 - The LTC2944 slightly underestimates current at lower values
 - Overall accuracy is within:
   - ~1.5% at low current
-  - <0.5% above ~5 A
+  - <0.25% above ~5 A
 
 ---
 
