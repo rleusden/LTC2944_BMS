@@ -22,11 +22,11 @@ The excellent article ["A Closer Look at State of Charge (SOC) and State of Heal
 - IR (internal-resistance) compensation so SOC is accurate under load
 - Adaptive coulomb counting once the battery has been calibrated
 - Automatic internal-resistance learning — improves accuracy over time without user intervention
-- EEPROM persistence for calibration data and the learned resistance model (wear-levelled, CRC-verified)
+- EEPROM persistence for calibration data and the learned resistance model (wear-leveled, CRC-verified)
 - Battery-disconnect detection with EEPROM flag (survives power loss)
 - Calibration state machine: zero offset → discharge to empty → charge to full
 - Alarm bitfield for over/under voltage, temperature, over-current, and profile mismatch
-- All battery profiles stored in flash (PROGMEM) to conserve RAM
+- On the ATmega328P-based boards, all battery profiles are stored in flash (PROGMEM) to conserve RAM
 
 ## Currently being tested, part of v1.9.x
 
@@ -34,8 +34,6 @@ The excellent article ["A Closer Look at State of Charge (SOC) and State of Heal
 RemainingMah and runtimeMinutes are scaled by a piecewise-linear derating factor: −20 °C → 60 %, 25 °C → 100 %, 60 °C → 95 %. SOC itself is unaffected; only derived energy outputs are derated.
 - SOH (State of Health) estimation
 Measured Cmax (from the ACR span between empty and full calibration anchors) is compared to rated capacity at the end of each full calibration cycle. SOH % persisted to EEPROM. Exposed via getSoh() and BmsMeasurement.soh
-- Self-discharge correction
-A configurable rate (mAh/hour, default 0.05 ≈ 1 %/month on 3 Ah) is subtracted from the eta-corrected accumulator each update tick. Configurable via setSelfDischargeRate(). Set 0 to disable.
 - Coulombic efficiency (η) correction
 Separate charge and discharge efficiency factors (default ηc = 0.99, ηd = 1.00) are applied to a floating-point ACR shadow register. Prevents SOC drift from round-trip losses over many cycles. Configurable via setEfficiency().
 
