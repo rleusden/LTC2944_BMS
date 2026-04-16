@@ -1,9 +1,14 @@
-# LTC2944_BMS
+# LTC2944 / INA228 BMS
 
-An Arduino library for the **LTC2944 battery gas gauge IC**, supporting Li-ion,
+An Arduino library for the **LTC2944 battery gas gauge IC** / **INA228 Power Monitor**, supporting Li-ion,
 LiFePO4, AGM, and GEL battery packs across a wide range of series-cell configurations.
 
-Versions 1.x.x Designed for **ATmega328P** boards (Arduino Pro Mini, Nano, Uno).
+Versions 1.0.x Designed for **ATmega328P** boards (Arduino Pro Mini, Nano, Uno). with the LTC2944 board
+
+Versions 1.1.x Designed for **ATmega328P** boards (Arduino Pro Mini, Nano, Uno). with support for the [Adafruit INA228 board](https://www.adafruit.com/product/5832)
+For the INA228, I will use parts of Rob Tillaart's [INA228 library](https://github.com/RobTillaart/INA228).
+
+### Update 16-4-2026: The INA228 version is currently under development.
 
 Upcoming versions 2.x.x Designed for the Raspberry RP2040-Zero.
 
