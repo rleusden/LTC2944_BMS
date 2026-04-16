@@ -18,24 +18,50 @@ The excellent article ["A Closer Look at State of Charge (SOC) and State of Heal
 
 ## Features
 
-- State-of-charge (SOC) estimation using a piecewise voltage curve
-- IR (internal-resistance) compensation so SOC is accurate under load
-- Adaptive coulomb counting once the battery has been calibrated
-- Automatic internal-resistance learning — improves accuracy over time without user intervention
-- EEPROM persistence for calibration data and the learned resistance model (wear-leveled, CRC-verified)
-- Battery-disconnect detection with EEPROM flag (survives power loss)
-- Calibration state machine: zero offset → discharge to empty → charge to full
-- Alarm bitfield for over/under voltage, temperature, over-current, and profile mismatch
-- On the ATmega328P-based boards, all battery profiles are stored in flash (PROGMEM) to conserve RAM
+### ✅ SOC estimation using a piecewise voltage curve
+Fully implemented. _socFromVoltageCurve() and _socFromOcvCurve() handle this. Li-ion and LiFePO4 use 11-point PROGMEM OCV tables; lead-acid falls back to a two-segment piecewise linear curve through vEmpty → vNominal → vFull.
 
-## Currently being tested, part of v1.9.x
+### ✅ IR compensation so SOC is accurate under load
+Fully implemented. _socFromVoltageCurve() removes the signed IR drop via compV = cellV - (currentA * irOhm * relax) where irOhm = _effectiveResistance(). A smooth interpolated relax factor (0 → 1 between 50 mA and 500 mA) prevents abrupt switching at low currents.
 
-- Temperature capacity derating
-RemainingMah and runtimeMinutes are scaled by a piecewise-linear derating factor: −20 °C → 60 %, 25 °C → 100 %, 60 °C → 95 %. SOC itself is unaffected; only derived energy outputs are derated.
-- SOH (State of Health) estimation
-Measured Cmax (from the ACR span between empty and full calibration anchors) is compared to rated capacity at the end of each full calibration cycle. SOH % persisted to EEPROM. Exposed via getSoh() and BmsMeasurement.soh
-- Coulombic efficiency (η) correction
-Separate charge and discharge efficiency factors (default ηc = 0.99, ηd = 1.00) are applied to a floating-point ACR shadow register. Prevents SOC drift from round-trip losses over many cycles. Configurable via setEfficiency().
+### ✅ Adaptive coulomb counting once calibrated
+Fully implemented. _estimateCoulombSoc() uses _etaAcrAccum mapped against the calibrated empty/full ACR anchors. _adaptiveBlend() then weights coulomb vs. voltage SOC as a function of current magnitude — more current → more weight on coulomb counting.
+
+###  ✅ Automatic internal-resistance learning
+Fully implemented. _updateResistanceLearning() uses a dV/dI estimator with an EMA (α = 0.10), only firing on discharge step transitions (charge transitions are explicitly rejected). Confidence saturates at 12 samples. _effectiveResistance() returns 0 until confidence ≥ 50%.
+
+### ✅ EEPROM persistence for calibration data and the learned resistance model (wear-leveled, CRC-verified)
+Fully implemented. The learned model uses two alternating slots (EE_LEARNED_SLOT_A / B) with a monotonic sequence counter — this is the classic wear-leveling ping-pong pattern. Each LearnedRecord is protected by a CRC-8. Calibration data (empty/full voltage and raw ACR anchors) is stored with its own magic words. Load/save on begin() and periodically every 30 minutes.
+
+### ✅ Battery-disconnect detection with EEPROM flag
+Fully implemented. _checkDisconnectOnMeasurement() detects low voltage + near-zero current and writes DISCONNECT_MARKER (0xD1) to EE_DISCONNECT. _readDisconnectFlag() reads it back on boot. _clearDisconnectFlag() clears it when a valid voltage is seen again.
+
+### ✅ Calibration state machine: zero offset → discharge to empty → charge to full
+Fully implemented. The CalPhase enum covers CAL_NONE → CAL_ZERO → CAL_WAIT → CAL_DISCHARGE → CAL_CHARGE → CAL_DONE (plus CAL_ABORT). The zero phase averages 32 samples of the current register at rest to derive _currentOffset_mA. Discharge watches for vbat ≤ vEmpty. The charge phase detects full via voltage threshold, peak-drop detection, and charger-cutoff sensing.
+
+### ✅ Alarm bitfield for over/under voltage, temperature, over-current, and profile mismatch
+Fully implemented. _makeAlarms() produces an 11-bit field including ALARM_UNDER_VOLTAGE, ALARM_OVER_VOLTAGE, ALARM_ABS_UNDER_V, ALARM_ABS_OVER_V, ALARM_TEMPERATURE, ALARM_OVER_CURRENT, ALARM_CHARGE_CURRENT, ALARM_PROFILE_MISMATCH, ALARM_ACR_ROLLOVER, ALARM_SENSOR_FAIL, and ALARM_NO_PROFILE.
+
+### ✅ Battery profiles stored in PROGMEM
+Fully implemented. kProfiles[], kOcvLiion[], kOcvLfp[], and all profile name strings are declared with PROGMEM. _resolveProfile() uses memcpy_P and pgm_read_word to read them safely.
+
+### ✅ Temperature capacity derating
+Fully implemented and matches the exact spec. _tempDerateFactor() returns 0.60 at −20 °C, 1.00 at 25 °C, and 0.95 at 60 °C via two linear segments. Only remainingMah and runtimeMinutes are scaled; soc is not.
+
+### ✅ SOH estimation
+Fully implemented. At the end of CAL_CHARGE, the ACR span between the empty and full anchors is converted to mAh and compared to _capacityMah. The result is persisted to EE_SOH_VALUE (with its own magic word) and exposed via getSoh() and BmsMeasurement.soh.
+
+### ✅ Coulombic efficiency (η) correction
+Fully implemented. _updateEtaAccum() applies _etaCharge to positive ACR deltas and _etaDischarge to negative ones. The shadow register _etaAcrAccum is used everywhere in place of raw ACR for SOC calculations. Defaults: ηc = 0.99, ηd = 1.00. Configurable via setEfficiency().
+
+### ✅ Self-discharge correction
+Fully implemented. A configurable bleed rate (mAh/hour, default 0.05) is subtracted from the η-corrected ACR accumulator on every update tick. On boot, the elapsed time since the last EEPROM timestamp is used to back-apply the loss before any measurement is taken. Disabled by passing 0.0 to setSelfDischargeRate().
+
+### ✅ ACR rollover detection
+Fully implemented. The 16-bit ACR register wraps from 0xFFFF back to 0x0000 on a sufficiently discharged or long-running pack. The library detects this by watching for a large downward jump (_lastRawACR > 0x8000 && rawACR < 0x1000) and sets ALARM_ACR_ROLLOVER in the alarm bitfield. For that cycle, SOC falls back to voltage-only estimation to avoid a spurious reading from the corrupted coulomb count.
+
+### ✅ Compile-time debug mode
+Fully implemented. Setting LTC2944_BMS_ENABLE_DEBUG to 1 enables a BmsDebugState struct that captures per-cycle internals: final, voltage, and coulomb SOC with source label (VOLTAGE_BOOT, VOLTAGE_ROLLOVER, VOLTAGE_ONLY, BLEND), IR-compensated pack and cell OCV estimates, effective resistance, temperature derate factor, raw register values, and ACR boot-tick and rollover flags. The struct is retrieved via getDebugState() and printed via printDebugStatus(). When the flag is 0, the struct collapses to an empty type, adding zero RAM or flash overhead.
 
 ---
 
