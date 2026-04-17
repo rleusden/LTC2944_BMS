@@ -243,6 +243,18 @@ Total EEPROM used: ~220 bytes of the ATmega328P's 1024 bytes.
 
 ---
 
+## WARNING
+
+This is a DIY product/solution, so don’t use this for safety-critical systems or in any situation where there could be a risk to life.
+
+There is no warranty; it may not work as expected or at all.
+
+The use of this project is done so entirely at your own risk. It may involve electrical voltages which could kill - if in doubt, seek help.
+
+The use of this project may not be compliant with local laws or regulations - if in doubt, seek help.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
