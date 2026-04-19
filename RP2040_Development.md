@@ -1,5 +1,5 @@
-# BatteryGauge RP2040 v3.1 OLED Edition  
-## Current Architecture, Implemented Functionality and TODO Roadmap
+# BatteryGauge RP2040 v2.x.x OLED Edition  
+## Current Architecture, Implemented Functionality, and TODO Roadmap
 
 ---
 
@@ -8,7 +8,7 @@
 BatteryGauge RP2040 v2.0.1 is a standalone battery monitor platform based on:
 
 - **RP2040-Zero**
-- **LTC2944** battery gas gauge / coulomb counter
+- **LTC2944** battery gas gauge/coulomb counter
 - **SSD1306 OLED 128x32 I2C display**
 - **WS2812 status LED**
 
